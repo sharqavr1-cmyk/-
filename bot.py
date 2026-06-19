@@ -55,7 +55,7 @@ admin_kb = ReplyKeyboardMarkup(
         ["إيقاف البث", "إحصائيات"],
         ["إيقاف البثوث الشغالة", "تشغيل البثوث"],
         ["إضافة حساب مساعد", "حذف حساب مساعد"],
-        ["زود"]
+        ["زود", "نقص"]
     ], 
     resize_keyboard=True
 )
@@ -76,31 +76,23 @@ back_kb = ReplyKeyboardMarkup([["رجوع"]], resize_keyboard=True)
 
 # ================= مراقب المكالمات الصوتية (العودة التلقائية) =================
 async def vc_service_handler(event):
-    """
-    هذه الدالة تراقب الجروبات في الحساب المساعد
-    لو المكالمة اتقفلت ورجعت اتفتحت، هتدخل البوت يكمل تشغيل تلقائي
-    """
     global call_py
     if not call_py:
         return
     
-    # التأكد من أن الحدث يخص المكالمات الصوتية
-    if event.action and type(event.action).__name__ == "MessageActionGroupCall":
+    if getattr(event.message, 'action', None) and type(event.message.action).__name__ == "MessageActionGroupCall":
         c_id = event.chat_id
         
-        # البحث في البثوث النشطة لمعرفة إذا كان الجروب مسجل لدينا
         for active_id, info in list(active_streams.items()):
             if str(abs(active_id)) == str(abs(c_id)):
-                await asyncio.sleep(3) # الانتظار قليلاً حتى تكتمل تهيئة المكالمة من تليجرام
+                await asyncio.sleep(3) 
                 try:
-                    # إجلاء إجباري لتجنب تعليق الصوت
                     try:
                         await call_py.leave_call(active_id)
                         await asyncio.sleep(1)
                     except:
                         pass
                     
-                    # إعادة التشغيل بنفس الإذاعة السابقة
                     stream_url = STATIONS.get(info["station"])
                     await call_py.play(active_id, MediaStream(stream_url))
                 except Exception:
@@ -146,8 +138,8 @@ async def main_router(client, message):
                     user_steps.pop(user_id, None)
                     return
                 
-                # تفعيل مراقب المكالمات الصوتية للعودة التلقائية
-                assistant_client.add_event_handler(vc_service_handler, events.ServiceMessage())
+                # تفعيل مراقب المكالمات بالطريقة الصحيحة
+                assistant_client.add_event_handler(vc_service_handler, events.NewMessage())
                 
                 call_py = PyTgCalls(assistant_client)
                 await call_py.start()
@@ -170,18 +162,32 @@ async def main_router(client, message):
                 target_id = int(text.strip())
                 whitelisted_users.add(target_id)
                 user_steps.pop(user_id, None)
-                await message.reply(f"✅ تم بنجاح إضافة المستخدم `{target_id}` إلى قائمة الصلاحيات الإضافية. يمكنه الآن تشغيل أي عدد من البثوث!", reply_markup=kb)
+                await message.reply(f"✅ تم بنجاح إضافة المستخدم `{target_id}` إلى قائمة الصلاحيات. يمكنه الآن تشغيل أي عدد من البثوث!", reply_markup=kb)
             except ValueError:
                 await message.reply("❌ عذراً، يجب إرسال الأيدي كـ أرقام فقط! أعد إرساله بشكل صحيح أو اضغط 'رجوع':", reply_markup=back_kb)
             return
 
-        # 3. حالة انتظار رابط القناة/الجروب
+        # 3. حالة انتظار أيدي لحذف صلاحياته
+        if step_data == "WAITING_FOR_UNWHITELIST_ID" and is_admin:
+            try:
+                target_id = int(text.strip())
+                if target_id in whitelisted_users:
+                    whitelisted_users.remove(target_id)
+                    await message.reply(f"✅ تم بنجاح إزالة المستخدم `{target_id}` من قائمة الصلاحيات وعاد للحد الطبيعي.", reply_markup=kb)
+                else:
+                    await message.reply("⚠️ هذا الأيدي ليس موجوداً في قائمة الصلاحيات من الأساس.", reply_markup=kb)
+                user_steps.pop(user_id, None)
+            except ValueError:
+                await message.reply("❌ عذراً، يجب إرسال الأيدي كـ أرقام فقط! أعد إرساله بشكل صحيح أو اضغط 'رجوع':", reply_markup=back_kb)
+            return
+
+        # 4. حالة انتظار رابط القناة/الجروب
         if step_data == "WAITING_FOR_CHAT_ID":
             user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_input": text}
             await message.reply(f"✅ تم حفظ الرابط بنجاح.\nالآن اختر الإذاعة التي تريد تشغيلها في الكول:", reply_markup=stations_kb)
             return
 
-        # 4. حالة انتظار اختيار الإذاعة وتجهيز البث
+        # 5. حالة انتظار اختيار الإذاعة وتجهيز البث
         if isinstance(step_data, dict) and step_data.get("step") == "WAITING_FOR_STATION":
             station_name = text
             original_link = step_data["chat_input"].strip()
@@ -197,7 +203,6 @@ async def main_router(client, message):
                 chat_input_str = original_link.replace("https://", "").replace("http://", "")
                 entity = None
 
-                # الانضمام للمجموعة أو القناة
                 try:
                     if "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
                         hash_str = chat_input_str.split("/")[-1].replace("+", "")
@@ -258,7 +263,7 @@ async def main_router(client, message):
                     await wait_msg.delete()
                     await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح عبر حساب المساعد.", reply_markup=kb)
                     
-                    # === إرسال إشعار للمطور ===
+                    # إرسال إشعار للمطور
                     if user_id != ADMIN_ID:
                         user_name = message.from_user.first_name or 'مستخدم'
                         user_mention = f"[{user_name}](tg://user?id={user_id})"
@@ -291,7 +296,7 @@ async def main_router(client, message):
                 user_steps.pop(user_id, None)
             return
 
-        # 5. حالة انتظار لتحديد القناة لإيقافها
+        # 6. حالة انتظار لتحديد القناة لإيقافها
         if step_data == "WAITING_FOR_STOP_CHAT_ID":
             chat_input_str = text.strip()
             user_chats = {c_id: info for c_id, info in active_streams.items() if info["user_id"] == user_id}
@@ -374,6 +379,10 @@ async def main_router(client, message):
                 user_steps[user_id] = "WAITING_FOR_WHITELIST_ID"
                 await message.reply("يرجى إرسال أيدي (ID) الشخص الذي تريد السماح له بتشغيل بثوث متعددة بدون قيود:\n(اضغط 'رجوع' للتراجع عن العملية)", reply_markup=back_kb)
 
+            elif text == "نقص":
+                user_steps[user_id] = "WAITING_FOR_UNWHITELIST_ID"
+                await message.reply("يرجى إرسال أيدي (ID) الشخص الذي تريد سحب الصلاحيات الإضافية منه:\n(اضغط 'رجوع' للتراجع عن العملية)", reply_markup=back_kb)
+
             elif text == "إحصائيات":
                 count = len(active_streams)
                 await message.reply(f"📊 إحصائيات البوت:\n- إجمالي البثوث الشغالة حالياً في كل القنوات: **{count}** بث\n- عدد المستخدمين المستثنين المسموح لهم ببثوث متعددة: **{len(whitelisted_users)}**", reply_markup=kb)
@@ -429,7 +438,6 @@ async def main_router(client, message):
                             pass
                     active_streams.clear()
                     
-                    # إزالة مراقب الأحداث عند الحذف لتنظيف الذاكرة
                     try:
                         assistant_client.remove_event_handler(vc_service_handler)
                     except:
