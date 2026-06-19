@@ -6,6 +6,8 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
 # ================= إعدادات البوت من متغيرات البيئة =================
 API_ID = int(os.environ.get("API_ID", 0))
@@ -85,15 +87,16 @@ async def start_stream_request(client, message):
         return
 
     user_steps[user_id] = "WAITING_FOR_CHAT_ID"
-    await message.reply("يرجى إرسال أيدي (ID) القناة التي تريد تشغيل البث فيها:")
+    await message.reply("يرجى إرسال أيدي (ID)، أو معرف (اليوزرنيم)، أو رابط القناة/الجروب:")
 
-@app.on_message(filters.regex(r"^-?\d+$") & filters.private)
-async def receive_chat_id(client, message):
+# تعديل هنا ليقبل الروابط، اليوزرنيم، أو الأرقام
+@app.on_message(filters.regex(r"^(https?://t\.me/|@|-?\d+)") & filters.private)
+async def receive_chat_input(client, message):
     user_id = message.from_user.id
     if user_steps.get(user_id) == "WAITING_FOR_CHAT_ID":
-        chat_id = int(message.text)
-        user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_id": chat_id}
-        await message.reply(f"تم حفظ القناة: `{chat_id}`\nالآن اختر الإذاعة:", reply_markup=stations_kb)
+        chat_input = message.text
+        user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_input": chat_input}
+        await message.reply(f"تم حفظ القناة/الجروب: `{chat_input}`\nالآن اختر الإذاعة:", reply_markup=stations_kb)
 
 @app.on_message(filters.regex("^إذاعة") & filters.private)
 async def play_station(client, message):
@@ -102,22 +105,58 @@ async def play_station(client, message):
     
     if isinstance(step_data, dict) and step_data.get("step") == "WAITING_FOR_STATION":
         station_name = message.text
-        chat_id = step_data["chat_id"]
+        chat_input = step_data["chat_input"]
         stream_url = STATIONS.get(station_name)
         
         if not stream_url:
             return
         
+        wait_msg = await message.reply("⏳ جاري دخول الحساب المساعد وتجهيز البث...")
+        
         try:
-            # تم التحديث هنا إلى play
-            await call_py.play(chat_id, MediaStream(stream_url))
-            active_streams[user_id] = {"chat_id": chat_id, "station": station_name}
+            chat_input_str = str(chat_input).strip()
+            actual_chat_id = None
+
+            # معالجة المدخلات (رقم، يوزرنيم، أو رابط) والانضمام
+            try:
+                # إذا كان أيدي (رقم)
+                chat_to_resolve = int(chat_input_str)
+                entity = await assistant_client.get_entity(chat_to_resolve)
+                actual_chat_id = entity.id
+            except ValueError:
+                # إذا كان رابط خاص أو عام أو يوزرنيم
+                if "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
+                    hash_str = chat_input_str.split("/")[-1].replace("+", "")
+                    try:
+                        updates = await assistant_client(ImportChatInviteRequest(hash_str))
+                        actual_chat_id = updates.chats[0].id
+                    except Exception:
+                        # إذا كان الحساب منضم بالفعل
+                        invite = await assistant_client(CheckChatInviteRequest(hash_str))
+                        actual_chat_id = invite.chat.id
+                else:
+                    username = chat_input_str.split("/")[-1] if "t.me/" in chat_input_str else chat_input_str
+                    try:
+                        await assistant_client(JoinChannelRequest(username))
+                    except Exception: 
+                        pass
+                    entity = await assistant_client.get_entity(username)
+                    actual_chat_id = entity.id
+
+            if not actual_chat_id:
+                await wait_msg.edit_text("❌ لم يتمكن الحساب المساعد من التعرف على القناة. تأكد من الرابط أو المعرف.")
+                return
+
+            # تشغيل البث باستخدام الأيدي الحقيقي
+            await call_py.play(actual_chat_id, MediaStream(stream_url))
+            active_streams[user_id] = {"chat_id": actual_chat_id, "station": station_name}
             
             kb = admin_kb if user_id == ADMIN_ID else user_kb
-            await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
+            await wait_msg.edit_text(f"✅ تم بدء بث **{station_name}** بنجاح.", reply_markup=kb)
             user_steps.pop(user_id, None)
+
         except Exception as e:
-            await message.reply(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`")
+            await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`")
 
 @app.on_message(filters.regex("^إيقاف البث$") & filters.private)
 async def stop_user_stream(client, message):
@@ -125,7 +164,6 @@ async def stop_user_stream(client, message):
     if user_id in active_streams:
         chat_id = active_streams[user_id]["chat_id"]
         try:
-            # تم التحديث هنا إلى leave_call
             await call_py.leave_call(chat_id)
         except:
             pass
@@ -177,7 +215,6 @@ async def handle_admin_text(client, message):
     if text == "إيقاف البثوث الشغالة":
         for uid, info in list(active_streams.items()):
             try:
-                # تم التحديث هنا إلى leave_call
                 await call_py.leave_call(info["chat_id"])
             except:
                 pass
@@ -193,7 +230,6 @@ async def handle_admin_text(client, message):
         for uid, info in list(paused_streams.items()):
             try:
                 stream_url = STATIONS.get(info["station"])
-                # تم التحديث هنا إلى play
                 await call_py.play(info["chat_id"], MediaStream(stream_url))
                 active_streams[uid] = info
             except:
@@ -205,7 +241,6 @@ async def handle_admin_text(client, message):
         if call_py:
             for uid, info in list(active_streams.items()):
                 try:
-                    # تم التحديث هنا إلى leave_call
                     await call_py.leave_call(info["chat_id"])
                 except:
                     pass
