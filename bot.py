@@ -6,7 +6,7 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat  # استيراد الأنواع للتفريق بين القنوات والمجموعات
+from telethon.tl.types import Channel, Chat  
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
@@ -125,13 +125,13 @@ async def main_router(client, message):
             await message.reply("❌ الرجاء اختيار إذاعة صحيحة من الأزرار أو اضغط 'إلغاء'.")
             return
         
-        wait_msg = await message.reply("⏳ جاري دخول الحساب المساعد وتجهيز البث...")
+        wait_msg = await message.reply("⏳ جاري فحص المكالمة وتجهيز البث...")
         
         try:
             chat_input_str = str(chat_input).strip()
             entity = None
 
-            # محاولة جلب الكيان (Entity) بكافة الطرق والروابط
+            # محاولة جلب القناة والانضمام إليها كعضو عالي
             try:
                 if chat_input_str.lstrip("-").isdigit():
                     chat_to_resolve = int(chat_input_str)
@@ -161,23 +161,32 @@ async def main_router(client, message):
                 user_steps.pop(user_id, None)
                 return
 
-            # --- هنا حل المشكلة الحاسم: تهيئة الأيدي بما يتوافق مع PyTgCalls ---
+            # تحديد الأيدي المناسب لـ PyTgCalls
             if isinstance(entity, Channel):
-                actual_chat_id = int(f"-100{entity.id}")  # إضافة البادئة للقنوات والمجموعات الخارقة
+                actual_chat_id = int(f"-100{entity.id}")
             elif isinstance(entity, Chat):
-                actual_chat_id = -entity.id              # المجموعات العادية تكون سالبة فقط
+                actual_chat_id = -entity.id
             else:
                 actual_chat_id = entity.id
 
-            # تشغيل الصوت بالمُعرف الجديد المضمون
-            await call_py.play(actual_chat_id, MediaStream(stream_url))
-            active_streams[user_id] = {"chat_id": actual_chat_id, "station": station_name}
+            # تشغيل البث والتحقق من حالة المكالمة
+            try:
+                await call_py.play(actual_chat_id, MediaStream(stream_url))
+                active_streams[user_id] = {"chat_id": actual_chat_id, "station": station_name}
+                await wait_msg.edit_text(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
             
-            await wait_msg.edit_text(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
+            except Exception as call_error:
+                error_str = str(call_error)
+                # إذا ظهر خطأ إن الصلاحيات غير كافية لإنشاء مكالمة، فهذا معناه حتماً أن المكالمة مغلقة والحساب حاول فتحها وفشل
+                if "CreateGroupCallRequest" in error_str or "privileges are required" in error_str or "GroupCallNotFound" in error_str:
+                    await wait_msg.edit_text("❌ المكالمة مقفولة! يرجى فتح المكالمة الصوتية في القناة/الجروب أولاً ثم اضغط بدء البث مجدداً.", reply_markup=kb)
+                else:
+                    await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل البث:\n`{call_error}`", reply_markup=kb)
+
             user_steps.pop(user_id, None)
 
         except Exception as e:
-            await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`", reply_markup=kb)
+            await wait_msg.edit_text(f"❌ حدث خطأ عام:\n`{e}`", reply_markup=kb)
             user_steps.pop(user_id, None)
         return
 
