@@ -58,57 +58,74 @@ stations_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ================= دوال التحكم =================
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client, message):
-    user_steps.pop(message.from_user.id, None)
-    kb = admin_kb if message.from_user.id == ADMIN_ID else user_kb
-    await message.reply("مرحباً بك في بوت الإذاعات القرآنية.\nاختر من القائمة بالأسفل:", reply_markup=kb)
-
-@app.on_message(filters.regex("^حالة البث$") & filters.private)
-async def stream_status(client, message):
-    user_id = message.from_user.id
-    if user_id in active_streams:
-        info = active_streams[user_id]
-        await message.reply(f"✅ لديك بث شغال حالياً:\n- القناة: `{info['chat_id']}`\n- الإذاعة: {info['station']}")
-    else:
-        await message.reply("❌ لا يوجد لديك أي بث شغال حالياً.")
-
-@app.on_message(filters.regex("^بدء البث$") & filters.private)
-async def start_stream_request(client, message):
-    user_id = message.from_user.id
-    if user_id in active_streams:
-        await message.reply("⚠️ لا يمكنك تشغيل أكثر من بث واحد في نفس الوقت. قم بإيقاف البث الحالي أولاً.")
-        return
+# ================= الموجه الرئيسي للنصوص والأزرار =================
+@app.on_message(filters.text & filters.private)
+async def main_router(client, message):
+    global assistant_client, call_py, assistant_session_string
     
-    if not call_py:
-        await message.reply("❌ لم يتم إضافة حساب مساعد من قبل المطور بعد.")
-        return
-
-    user_steps[user_id] = "WAITING_FOR_CHAT_ID"
-    await message.reply("يرجى إرسال أيدي (ID)، أو معرف (اليوزرنيم)، أو رابط القناة/الجروب:")
-
-# تعديل هنا ليقبل الروابط، اليوزرنيم، أو الأرقام
-@app.on_message(filters.regex(r"^(https?://t\.me/|@|-?\d+)") & filters.private)
-async def receive_chat_input(client, message):
+    text = message.text
     user_id = message.from_user.id
-    if user_steps.get(user_id) == "WAITING_FOR_CHAT_ID":
-        chat_input = message.text
-        user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_input": chat_input}
-        await message.reply(f"تم حفظ القناة/الجروب: `{chat_input}`\nالآن اختر الإذاعة:", reply_markup=stations_kb)
+    is_admin = (user_id == ADMIN_ID)
+    
+    # لوحة المفاتيح الافتراضية للمستخدم الحالي
+    kb = admin_kb if is_admin else user_kb
 
-@app.on_message(filters.regex("^إذاعة") & filters.private)
-async def play_station(client, message):
-    user_id = message.from_user.id
+    # ----------------- فحص حالة المستخدم (State Machine) -----------------
     step_data = user_steps.get(user_id)
-    
+
+    # 1. حالة انتظار جلسة الحساب المساعد
+    if step_data == "WAITING_FOR_SESSION" and is_admin:
+        wait_msg = await message.reply("⏳ جاري فحص الجلسة والاتصال...")
+        try:
+            assistant_session_string = text
+            # نستخدم connect بدلاً من start لتجنب تجميد البوت إذا كانت الجلسة خاطئة
+            assistant_client = TelegramClient(StringSession(assistant_session_string), API_ID, API_HASH)
+            await assistant_client.connect()
+            
+            if not await assistant_client.is_user_authorized():
+                await wait_msg.edit_text("❌ الجلسة غير صالحة أو منتهية. يرجى استخراج جلسة جديدة وإضافتها.", reply_markup=kb)
+                await assistant_client.disconnect()
+                assistant_client = None
+                user_steps.pop(user_id, None)
+                return
+            
+            call_py = PyTgCalls(assistant_client)
+            await call_py.start()
+            
+            user_steps.pop(user_id, None)
+            await wait_msg.edit_text("✅ تم تفعيل الحساب المساعد وربطه بنجاح. البوت جاهز الآن للعمل!", reply_markup=kb)
+        except Exception as e:
+            await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل الجلسة:\n`{e}`", reply_markup=kb)
+            if assistant_client:
+                await assistant_client.disconnect()
+                assistant_client = None
+            user_steps.pop(user_id, None)
+        return
+
+    # 2. حالة انتظار أيدي أو رابط القناة
+    if step_data == "WAITING_FOR_CHAT_ID":
+        if text == "إلغاء":
+            user_steps.pop(user_id, None)
+            await message.reply("✅ تم الإلغاء.", reply_markup=kb)
+            return
+        
+        user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_input": text}
+        await message.reply(f"✅ تم حفظ القناة/الجروب: `{text}`\nالآن اختر الإذاعة التي تريد تشغيلها:", reply_markup=stations_kb)
+        return
+
+    # 3. حالة انتظار اختيار الإذاعة
     if isinstance(step_data, dict) and step_data.get("step") == "WAITING_FOR_STATION":
-        station_name = message.text
+        if text == "إلغاء":
+            user_steps.pop(user_id, None)
+            await message.reply("✅ تم الإلغاء.", reply_markup=kb)
+            return
+            
+        station_name = text
         chat_input = step_data["chat_input"]
         stream_url = STATIONS.get(station_name)
         
         if not stream_url:
+            await message.reply("❌ الرجاء اختيار إذاعة صحيحة من الأزرار أو اضغط 'إلغاء'.")
             return
         
         wait_msg = await message.reply("⏳ جاري دخول الحساب المساعد وتجهيز البث...")
@@ -119,19 +136,16 @@ async def play_station(client, message):
 
             # معالجة المدخلات (رقم، يوزرنيم، أو رابط) والانضمام
             try:
-                # إذا كان أيدي (رقم)
-                chat_to_resolve = int(chat_input_str)
-                entity = await assistant_client.get_entity(chat_to_resolve)
-                actual_chat_id = entity.id
-            except ValueError:
-                # إذا كان رابط خاص أو عام أو يوزرنيم
-                if "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
+                if chat_input_str.lstrip("-").isdigit():
+                    chat_to_resolve = int(chat_input_str)
+                    entity = await assistant_client.get_entity(chat_to_resolve)
+                    actual_chat_id = entity.id
+                elif "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
                     hash_str = chat_input_str.split("/")[-1].replace("+", "")
                     try:
                         updates = await assistant_client(ImportChatInviteRequest(hash_str))
                         actual_chat_id = updates.chats[0].id
                     except Exception:
-                        # إذا كان الحساب منضم بالفعل
                         invite = await assistant_client(CheckChatInviteRequest(hash_str))
                         actual_chat_id = invite.chat.id
                 else:
@@ -142,117 +156,123 @@ async def play_station(client, message):
                         pass
                     entity = await assistant_client.get_entity(username)
                     actual_chat_id = entity.id
-
-            if not actual_chat_id:
-                await wait_msg.edit_text("❌ لم يتمكن الحساب المساعد من التعرف على القناة. تأكد من الرابط أو المعرف.")
+            except Exception as e:
+                await wait_msg.edit_text(f"❌ لم يتمكن الحساب المساعد من الانضمام أو العثور على القناة.\nالسبب: `{e}`", reply_markup=kb)
+                user_steps.pop(user_id, None)
                 return
 
-            # تشغيل البث باستخدام الأيدي الحقيقي
+            if not actual_chat_id:
+                await wait_msg.edit_text("❌ لم يتمكن الحساب المساعد من التعرف على القناة. تأكد من الرابط أو المعرف.", reply_markup=kb)
+                user_steps.pop(user_id, None)
+                return
+
             await call_py.play(actual_chat_id, MediaStream(stream_url))
             active_streams[user_id] = {"chat_id": actual_chat_id, "station": station_name}
             
-            kb = admin_kb if user_id == ADMIN_ID else user_kb
-            await wait_msg.edit_text(f"✅ تم بدء بث **{station_name}** بنجاح.", reply_markup=kb)
+            await wait_msg.edit_text(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
             user_steps.pop(user_id, None)
 
         except Exception as e:
-            await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`")
-
-@app.on_message(filters.regex("^إيقاف البث$") & filters.private)
-async def stop_user_stream(client, message):
-    user_id = message.from_user.id
-    if user_id in active_streams:
-        chat_id = active_streams[user_id]["chat_id"]
-        try:
-            await call_py.leave_call(chat_id)
-        except:
-            pass
-        del active_streams[user_id]
-        await message.reply("تم إيقاف البث الخاص بك بنجاح.")
-    else:
-        await message.reply("ليس لديك بث لإيقافه.")
-
-@app.on_message(filters.regex("^إلغاء$") & filters.private)
-async def cancel_action(client, message):
-    user_id = message.from_user.id
-    user_steps.pop(user_id, None)
-    kb = admin_kb if user_id == ADMIN_ID else user_kb
-    await message.reply("تم الإلغاء.", reply_markup=kb)
-
-# ================= أوامر المطور =================
-
-@app.on_message(filters.regex("^إحصائيات$") & filters.user(ADMIN_ID) & filters.private)
-async def show_stats(client, message):
-    count = len(active_streams)
-    await message.reply(f"📊 عدد القنوات التي يعمل فيها البث حالياً: **{count}**")
-
-@app.on_message(filters.regex("^إضافة حساب مساعد$") & filters.user(ADMIN_ID) & filters.private)
-async def ask_for_session(client, message):
-    user_steps[ADMIN_ID] = "WAITING_FOR_SESSION"
-    await message.reply("أرسل جلسة تليثون (String Session) الآن:")
-
-@app.on_message(filters.text & filters.user(ADMIN_ID) & filters.private)
-async def handle_admin_text(client, message):
-    global assistant_client, call_py, assistant_session_string
-    
-    text = message.text
-    
-    if user_steps.get(ADMIN_ID) == "WAITING_FOR_SESSION":
-        try:
-            assistant_session_string = text
-            assistant_client = TelegramClient(StringSession(assistant_session_string), API_ID, API_HASH)
-            await assistant_client.start()
-            
-            call_py = PyTgCalls(assistant_client)
-            await call_py.start()
-            
-            user_steps.pop(ADMIN_ID, None)
-            await message.reply("✅ تم تشغيل الحساب المساعد وربطه بنجاح.")
-        except Exception as e:
-            await message.reply(f"❌ الجلسة غير صالحة أو حدث خطأ:\n`{e}`")
+            await wait_msg.edit_text(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`", reply_markup=kb)
+            user_steps.pop(user_id, None)
         return
 
-    if text == "إيقاف البثوث الشغالة":
-        for uid, info in list(active_streams.items()):
-            try:
-                await call_py.leave_call(info["chat_id"])
-            except:
-                pass
-            paused_streams[uid] = info
-        active_streams.clear()
-        await message.reply("تم إيقاف جميع البثوث النشطة وحفظها لإعادة التشغيل لاحقاً.")
+    # ----------------- الأوامر الأساسية والأزرار -----------------
+    if text == "/start":
+        user_steps.pop(user_id, None)
+        await message.reply("مرحباً بك في بوت الإذاعات القرآنية.\nاختر من القائمة بالأسفل لتتحكم في البث:", reply_markup=kb)
 
-    elif text == "تشغيل البثوث":
-        if not paused_streams:
-            await message.reply("لا توجد بثوث متوقفة لإعادة تشغيلها.")
+    elif text == "حالة البث":
+        if user_id in active_streams:
+            info = active_streams[user_id]
+            await message.reply(f"✅ لديك بث شغال حالياً:\n- القناة: `{info['chat_id']}`\n- الإذاعة: {info['station']}", reply_markup=kb)
+        else:
+            await message.reply("❌ لا يوجد لديك أي بث شغال حالياً.", reply_markup=kb)
+
+    elif text == "بدء البث":
+        if user_id in active_streams:
+            await message.reply("⚠️ لا يمكنك تشغيل أكثر من بث واحد في نفس الوقت. قم بإيقاف البث الحالي أولاً.", reply_markup=kb)
             return
         
-        for uid, info in list(paused_streams.items()):
+        if not call_py:
+            await message.reply("❌ البوت غير جاهز! يجب على المطور إضافة حساب مساعد أولاً من زر 'إضافة حساب مساعد'.", reply_markup=kb)
+            return
+
+        user_steps[user_id] = "WAITING_FOR_CHAT_ID"
+        await message.reply("يرجى إرسال أيدي (ID)، أو معرف (اليوزرنيم)، أو رابط القناة/الجروب لتشغيل البث فيه:\n(يمكنك إرسال 'إلغاء' للتراجع)", reply_markup=ReplyKeyboardMarkup([["إلغاء"]], resize_keyboard=True))
+
+    elif text == "إيقاف البث":
+        if user_id in active_streams:
+            chat_id = active_streams[user_id]["chat_id"]
             try:
-                stream_url = STATIONS.get(info["station"])
-                await call_py.play(info["chat_id"], MediaStream(stream_url))
-                active_streams[uid] = info
+                await call_py.leave_call(chat_id)
             except:
                 pass
-        paused_streams.clear()
-        await message.reply("تم إعادة تشغيل البثوث المتوقفة بنجاح.")
+            del active_streams[user_id]
+            await message.reply("✅ تم إيقاف البث ومغادرة المكالمة بنجاح.", reply_markup=kb)
+        else:
+            await message.reply("❌ ليس لديك أي بث شغال لإيقافه.", reply_markup=kb)
 
-    elif text == "حذف حساب مساعد":
-        if call_py:
+    elif text == "إلغاء":
+        user_steps.pop(user_id, None)
+        await message.reply("✅ تم إلغاء العملية الحالية.", reply_markup=kb)
+
+    # ----------------- أوامر المطور فقط -----------------
+    elif is_admin:
+        if text == "إحصائيات":
+            count = len(active_streams)
+            await message.reply(f"📊 إحصائيات البوت:\n- البثوث الشغالة حالياً: **{count}**", reply_markup=kb)
+
+        elif text == "إضافة حساب مساعد":
+            user_steps[user_id] = "WAITING_FOR_SESSION"
+            await message.reply("يرجى إرسال كود الجلسة (String Session) الخاص بتليثون الآن:\n(يمكنك إرسال 'إلغاء' للتراجع)", reply_markup=ReplyKeyboardMarkup([["إلغاء"]], resize_keyboard=True))
+
+        elif text == "إيقاف البثوث الشغالة":
+            if not active_streams:
+                await message.reply("❌ لا يوجد أي بث شغال حالياً لإيقافه.", reply_markup=kb)
+                return
             for uid, info in list(active_streams.items()):
                 try:
                     await call_py.leave_call(info["chat_id"])
                 except:
                     pass
+                paused_streams[uid] = info
             active_streams.clear()
+            await message.reply("✅ تم إيقاف جميع البثوث النشطة مؤقتاً وحفظها لإعادة التشغيل لاحقاً.", reply_markup=kb)
+
+        elif text == "تشغيل البثوث":
+            if not paused_streams:
+                await message.reply("❌ لا توجد بثوث متوقفة لإعادة تشغيلها.", reply_markup=kb)
+                return
             
-            await assistant_client.disconnect()
-            assistant_client = None
-            call_py = None
-            assistant_session_string = None
-            await message.reply("تم إيقاف وحذف الحساب المساعد وتوقيف كافة البثوث.")
-        else:
-            await message.reply("لا يوجد حساب مساعد مضاف حالياً.")
+            success_count = 0
+            for uid, info in list(paused_streams.items()):
+                try:
+                    stream_url = STATIONS.get(info["station"])
+                    await call_py.play(info["chat_id"], MediaStream(stream_url))
+                    active_streams[uid] = info
+                    success_count += 1
+                except:
+                    pass
+            paused_streams.clear()
+            await message.reply(f"✅ تم إعادة تشغيل ({success_count}) بث بنجاح.", reply_markup=kb)
+
+        elif text == "حذف حساب مساعد":
+            if call_py:
+                for uid, info in list(active_streams.items()):
+                    try:
+                        await call_py.leave_call(info["chat_id"])
+                    except:
+                        pass
+                active_streams.clear()
+                
+                await assistant_client.disconnect()
+                assistant_client = None
+                call_py = None
+                assistant_session_string = None
+                await message.reply("✅ تم إيقاف كافة البثوث، وتسجيل الخروج، وحذف الحساب المساعد بنجاح.", reply_markup=kb)
+            else:
+                await message.reply("❌ لا يوجد حساب مساعد مسجل حالياً لحذفه.", reply_markup=kb)
 
 # ================= التشغيل الأساسي =================
 async def main():
