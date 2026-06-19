@@ -4,7 +4,7 @@ from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat  
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -27,7 +27,7 @@ active_streams = {}
 paused_streams = {}   
 user_steps = {}       
 whitelisted_users = set()  
-processing_users = set()  # نظام الحماية لمنع الضغط المتكرر وتهنيج البوت
+processing_users = set()  
 
 # ================= روابط الإذاعات =================
 STATIONS = {
@@ -74,6 +74,38 @@ stations_kb = ReplyKeyboardMarkup(
 
 back_kb = ReplyKeyboardMarkup([["رجوع"]], resize_keyboard=True)
 
+# ================= مراقب المكالمات الصوتية (العودة التلقائية) =================
+async def vc_service_handler(event):
+    """
+    هذه الدالة تراقب الجروبات في الحساب المساعد
+    لو المكالمة اتقفلت ورجعت اتفتحت، هتدخل البوت يكمل تشغيل تلقائي
+    """
+    global call_py
+    if not call_py:
+        return
+    
+    # التأكد من أن الحدث يخص المكالمات الصوتية
+    if event.action and type(event.action).__name__ == "MessageActionGroupCall":
+        c_id = event.chat_id
+        
+        # البحث في البثوث النشطة لمعرفة إذا كان الجروب مسجل لدينا
+        for active_id, info in list(active_streams.items()):
+            if str(abs(active_id)) == str(abs(c_id)):
+                await asyncio.sleep(3) # الانتظار قليلاً حتى تكتمل تهيئة المكالمة من تليجرام
+                try:
+                    # إجلاء إجباري لتجنب تعليق الصوت
+                    try:
+                        await call_py.leave_call(active_id)
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+                    
+                    # إعادة التشغيل بنفس الإذاعة السابقة
+                    stream_url = STATIONS.get(info["station"])
+                    await call_py.play(active_id, MediaStream(stream_url))
+                except Exception:
+                    pass
+
 # ================= الموجه الرئيسي للنصوص والأزرار =================
 @app.on_message(filters.text & filters.private)
 async def main_router(client, message):
@@ -81,7 +113,6 @@ async def main_router(client, message):
     
     user_id = message.from_user.id
     
-    # حماية من الضغط المتكرر: لو المستخدم طلب أمر ولسه بيتنفذ، نتجاهل الضغطات الجديدة
     if user_id in processing_users:
         return
     
@@ -92,7 +123,6 @@ async def main_router(client, message):
         is_admin = (user_id == ADMIN_ID)
         kb = admin_kb if is_admin else user_kb
         
-        # ----------------- زر الرجوع العام -----------------
         if text == "رجوع":
             user_steps.pop(user_id, None)
             await message.reply("✅ تم التراجع والعودة للقائمة الرئيسية.", reply_markup=kb)
@@ -116,6 +146,9 @@ async def main_router(client, message):
                     user_steps.pop(user_id, None)
                     return
                 
+                # تفعيل مراقب المكالمات الصوتية للعودة التلقائية
+                assistant_client.add_event_handler(vc_service_handler, events.ServiceMessage())
+                
                 call_py = PyTgCalls(assistant_client)
                 await call_py.start()
                 
@@ -131,7 +164,7 @@ async def main_router(client, message):
                 user_steps.pop(user_id, None)
             return
 
-        # 2. حالة انتظار أيدي لتزويد صلاحياته (خاص بالمطور)
+        # 2. حالة انتظار أيدي لتزويد صلاحياته
         if step_data == "WAITING_FOR_WHITELIST_ID" and is_admin:
             try:
                 target_id = int(text.strip())
@@ -164,6 +197,7 @@ async def main_router(client, message):
                 chat_input_str = original_link.replace("https://", "").replace("http://", "")
                 entity = None
 
+                # الانضمام للمجموعة أو القناة
                 try:
                     if "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
                         hash_str = chat_input_str.split("/")[-1].replace("+", "")
@@ -197,6 +231,8 @@ async def main_router(client, message):
                     user_steps.pop(user_id, None)
                     return
 
+                chat_title = getattr(entity, 'title', 'غير معروف')
+
                 if isinstance(entity, Channel):
                     actual_chat_id = int(f"-100{entity.id}")
                 elif isinstance(entity, Chat):
@@ -213,7 +249,6 @@ async def main_router(client, message):
 
                     await call_py.play(actual_chat_id, MediaStream(stream_url))
                     
-                    # حفظ البيانات شاملة الرابط الأصلي
                     active_streams[actual_chat_id] = {
                         "user_id": user_id, 
                         "station": station_name,
@@ -222,7 +257,24 @@ async def main_router(client, message):
                     
                     await wait_msg.delete()
                     await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح عبر حساب المساعد.", reply_markup=kb)
-                
+                    
+                    # === إرسال إشعار للمطور ===
+                    if user_id != ADMIN_ID:
+                        user_name = message.from_user.first_name or 'مستخدم'
+                        user_mention = f"[{user_name}](tg://user?id={user_id})"
+                        notify_text = (
+                            f"🔔 **إشعار تشغيل بث جديد**\n\n"
+                            f"👤 **المستخدم:** {user_mention}\n"
+                            f"📻 **الإذاعة:** **{station_name}**\n"
+                            f"📌 **اسم الجروب:** {chat_title}\n"
+                            f"🔗 **الرابط المدخل:** {original_link}\n"
+                            f"🆔 **أيدي الجروب:** `{actual_chat_id}`"
+                        )
+                        try:
+                            await app.send_message(ADMIN_ID, notify_text, disable_web_page_preview=True)
+                        except Exception:
+                            pass
+
                 except Exception as call_error:
                     error_str = str(call_error)
                     await wait_msg.delete()
@@ -275,7 +327,6 @@ async def main_router(client, message):
                 for c_id, info in user_chats.items():
                     link = info.get('link', 'غير متوفر')
                     msg += f"- الأيدي: `{c_id}`\n- الرابط: {link}\n- الإذاعة: **{info['station']}**\n\n"
-                # disable_web_page_preview لمنع ظهور صندوق معاينة الروابط لكل قناة
                 await message.reply(msg, reply_markup=kb, disable_web_page_preview=True)
             else:
                 await message.reply("❌ لا يوجد لديك أي بث شغال حالياً.", reply_markup=kb)
@@ -378,6 +429,12 @@ async def main_router(client, message):
                             pass
                     active_streams.clear()
                     
+                    # إزالة مراقب الأحداث عند الحذف لتنظيف الذاكرة
+                    try:
+                        assistant_client.remove_event_handler(vc_service_handler)
+                    except:
+                        pass
+                        
                     await assistant_client.disconnect()
                     assistant_client = None
                     call_py = None
@@ -387,7 +444,6 @@ async def main_router(client, message):
                     await message.reply("❌ لا يوجد حساب مساعد مسجل حالياً لحذفه.", reply_markup=kb)
 
     finally:
-        # تأكد من إزالة المستخدم من قائمة الضغط حتى لو حصل خطأ أثناء التنفيذ
         processing_users.discard(user_id)
 
 # ================= التشغيل الأساسي =================
