@@ -1,0 +1,5 @@
+Pyrogram==2.0.106
+py-tgcalls==2.2.11
+yt-dlp
+tgcrypto
+Telethon
