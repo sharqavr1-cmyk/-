@@ -1,14 +1,13 @@
 import asyncio
 import os
 from pyrogram import Client, filters
-from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
+from pyrogram.types import ReplyKeyboardMarkup
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ================= إعدادات البوت من متغيرات البيئة =================
-# نستخدم int() مع الـ IDs لأن مكتبة os بتسترجع البيانات كنصوص (Strings)
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -21,13 +20,10 @@ assistant_client = None
 call_py = None
 assistant_session_string = None
 
-# ... (باقي الكود كما هو بالظبط بدون أي تغيير) ...
-# قواميس لتتبع الحالة والبثوث (تخزين مؤقت)
-active_streams = {}   # {user_id: {"chat_id": 123, "station": "المنشاوي"}}
-paused_streams = {}   # لتخزين البثوث التي تم إيقافها برمجياً لإعادة تشغيلها
-user_steps = {}       # لتتبع خطوات المستخدم (مثل انتظار أيدي القناة أو الجلسة)
+active_streams = {}   
+paused_streams = {}   
+user_steps = {}       
 
-# روابط إذاعات حقيقية ومباشرة (لا يتم تحميلها)
 STATIONS = {
     "إذاعة محمد المنشاوي": "https://backup.qurango.net/radio/mohammed_siddiq_alminshawi",
     "إذاعة عبدالباسط": "https://backup.qurango.net/radio/abdulbasit_abdulsamad_mojawwad",
@@ -91,16 +87,13 @@ async def start_stream_request(client, message):
     user_steps[user_id] = "WAITING_FOR_CHAT_ID"
     await message.reply("يرجى إرسال أيدي (ID) القناة التي تريد تشغيل البث فيها:")
 
-@app.on_message(filters.regex("^-?\d+$") & filters.private)
+@app.on_message(filters.regex(r"^-?\d+$") & filters.private)
 async def receive_chat_id(client, message):
     user_id = message.from_user.id
     if user_steps.get(user_id) == "WAITING_FOR_CHAT_ID":
-        try:
-            chat_id = int(message.text)
-            user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_id": chat_id}
-            await message.reply(f"تم حفظ القناة: `{chat_id}`\nالآن اختر الإذاعة:", reply_markup=stations_kb)
-        except ValueError:
-            await message.reply("أيدي القناة غير صالح، تأكد من كتابة الأرقام فقط.")
+        chat_id = int(message.text)
+        user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_id": chat_id}
+        await message.reply(f"تم حفظ القناة: `{chat_id}`\nالآن اختر الإذاعة:", reply_markup=stations_kb)
 
 @app.on_message(filters.regex("^إذاعة") & filters.private)
 async def play_station(client, message):
@@ -116,15 +109,15 @@ async def play_station(client, message):
             return
         
         try:
-            # تشغيل البث مباشرة من الرابط دون تحميل (MediaStream)
-            await call_py.join_group_call(chat_id, MediaStream(stream_url))
+            # تم التحديث هنا إلى play
+            await call_py.play(chat_id, MediaStream(stream_url))
             active_streams[user_id] = {"chat_id": chat_id, "station": station_name}
             
             kb = admin_kb if user_id == ADMIN_ID else user_kb
             await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
             user_steps.pop(user_id, None)
         except Exception as e:
-            await message.reply(f"❌ حدث خطأ أثناء تشغيل البث (تأكد أن البوت مشرف وأن المكالمة مفتوحة):\n`{e}`")
+            await message.reply(f"❌ حدث خطأ أثناء تشغيل البث:\n`{e}`")
 
 @app.on_message(filters.regex("^إيقاف البث$") & filters.private)
 async def stop_user_stream(client, message):
@@ -132,7 +125,8 @@ async def stop_user_stream(client, message):
     if user_id in active_streams:
         chat_id = active_streams[user_id]["chat_id"]
         try:
-            await call_py.leave_group_call(chat_id)
+            # تم التحديث هنا إلى leave_call
+            await call_py.leave_call(chat_id)
         except:
             pass
         del active_streams[user_id]
@@ -165,7 +159,6 @@ async def handle_admin_text(client, message):
     
     text = message.text
     
-    # معالجة إضافة الجلسة
     if user_steps.get(ADMIN_ID) == "WAITING_FOR_SESSION":
         try:
             assistant_session_string = text
@@ -181,18 +174,17 @@ async def handle_admin_text(client, message):
             await message.reply(f"❌ الجلسة غير صالحة أو حدث خطأ:\n`{e}`")
         return
 
-    # إيقاف جميع البثوث
     if text == "إيقاف البثوث الشغالة":
         for uid, info in list(active_streams.items()):
             try:
-                await call_py.leave_group_call(info["chat_id"])
+                # تم التحديث هنا إلى leave_call
+                await call_py.leave_call(info["chat_id"])
             except:
                 pass
             paused_streams[uid] = info
         active_streams.clear()
         await message.reply("تم إيقاف جميع البثوث النشطة وحفظها لإعادة التشغيل لاحقاً.")
 
-    # تشغيل البثوث المتوقفة
     elif text == "تشغيل البثوث":
         if not paused_streams:
             await message.reply("لا توجد بثوث متوقفة لإعادة تشغيلها.")
@@ -201,20 +193,20 @@ async def handle_admin_text(client, message):
         for uid, info in list(paused_streams.items()):
             try:
                 stream_url = STATIONS.get(info["station"])
-                await call_py.join_group_call(info["chat_id"], MediaStream(stream_url))
+                # تم التحديث هنا إلى play
+                await call_py.play(info["chat_id"], MediaStream(stream_url))
                 active_streams[uid] = info
             except:
                 pass
         paused_streams.clear()
         await message.reply("تم إعادة تشغيل البثوث المتوقفة بنجاح.")
 
-    # حذف الحساب المساعد
     elif text == "حذف حساب مساعد":
         if call_py:
-            # إيقاف كل شيء أولاً
             for uid, info in list(active_streams.items()):
                 try:
-                    await call_py.leave_group_call(info["chat_id"])
+                    # تم التحديث هنا إلى leave_call
+                    await call_py.leave_call(info["chat_id"])
                 except:
                     pass
             active_streams.clear()
@@ -232,7 +224,6 @@ async def main():
     print("جاري تشغيل البوت...")
     await app.start()
     print("البوت يعمل الآن! في انتظار الأوامر...")
-    # إبقاء البوت يعمل
     while True:
         await asyncio.sleep(3600)
 
