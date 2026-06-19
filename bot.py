@@ -134,10 +134,10 @@ async def main_router(client, message):
             await message.reply("❌ عذراً، يجب إرسال الأيدي كـ أرقام فقط! أعد إرساله بشكل صحيح أو اضغط 'رجوع':", reply_markup=back_kb)
         return
 
-    # 3. حالة انتظار أيدي أو رابط القناة
+    # 3. حالة انتظار رابط القناة/الجروب
     if step_data == "WAITING_FOR_CHAT_ID":
         user_steps[user_id] = {"step": "WAITING_FOR_STATION", "chat_input": text}
-        await message.reply(f"✅ تم حفظ القناة/الجروب: `{text}`\nالآن اختر الإذاعة التي تريد تشغيلها:", reply_markup=stations_kb)
+        await message.reply(f"✅ تم حفظ الرابط بنجاح.\nالآن اختر الإذاعة التي تريد تشغيلها في الكول:", reply_markup=stations_kb)
         return
 
     # 4. حالة انتظار اختيار الإذاعة وتجهيز البث
@@ -150,26 +150,29 @@ async def main_router(client, message):
             await message.reply("❌ الرجاء اختيار إذاعة صحيحة من الأزرار أو اضغط 'رجوع'.")
             return
         
-        wait_msg = await message.reply("⏳ جاري فحص المكالمة وتجهيز البث...")
+        wait_msg = await message.reply("⏳ جاري الانضمام وفحص المكالمة وتنشيط الصوت...")
         
         try:
-            chat_input_str = str(chat_input).strip()
+            chat_input_str = str(chat_input).strip().replace("https://", "").replace("http://", "")
             entity = None
 
+            # معالجة الروابط والانضمام التلقائي للمساعد
             try:
-                if chat_input_str.lstrip("-").isdigit():
-                    chat_to_resolve = int(chat_input_str)
-                    entity = await assistant_client.get_entity(chat_to_resolve)
-                elif "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
+                if "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
                     hash_str = chat_input_str.split("/")[-1].replace("+", "")
                     try:
                         updates = await assistant_client(ImportChatInviteRequest(hash_str))
                         entity = updates.chats[0]
                     except Exception:
-                        invite = await assistant_client(CheckChatInviteRequest(hash_str))
-                        entity = invite.chat
+                        try:
+                            invite = await assistant_client(CheckChatInviteRequest(hash_str))
+                            entity = invite.chat
+                        except Exception:
+                            pass
                 else:
-                    username = chat_input_str.split("/")[-1] if "t.me/" in chat_input_str else chat_input_str
+                    username = chat_input_str.split("/")[-1]
+                    if "?" in username:
+                        username = username.split("?")[0]
                     try:
                         await assistant_client(JoinChannelRequest(username))
                     except Exception: 
@@ -177,13 +180,13 @@ async def main_router(client, message):
                     entity = await assistant_client.get_entity(username)
             except Exception as e:
                 await wait_msg.delete()
-                await message.reply(f"❌ لم يتمكن الحساب المساعد من الوصول للقناة أو الجروب.\nالسبب: `{e}`", reply_markup=kb)
+                await message.reply(f"❌ لم يتمكن الحساب المساعد من دخول الجروب عبر الرابط المرسل.\nالسبب: `{e}`", reply_markup=kb)
                 user_steps.pop(user_id, None)
                 return
 
             if not entity:
                 await wait_msg.delete()
-                await message.reply("❌ لم يتم التعرف على القناة. تأكد من صحة الرابط أو المعرف.", reply_markup=kb)
+                await message.reply("❌ لم يتم التعرف على الرابط أو الجروب بشكل صحيح. تأكد من صحة الرابط.", reply_markup=kb)
                 user_steps.pop(user_id, None)
                 return
 
@@ -195,16 +198,23 @@ async def main_router(client, message):
                 actual_chat_id = entity.id
 
             try:
+                # تكتيك لمنع تعليق الصوت الصامت: تنظيف فريش للكول أولاً
+                try:
+                    await call_py.leave_call(actual_chat_id)
+                    await asyncio.sleep(0.5)
+                except:
+                    pass
+
                 await call_py.play(actual_chat_id, MediaStream(stream_url))
                 active_streams[actual_chat_id] = {"user_id": user_id, "station": station_name}
                 await wait_msg.delete()
-                await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح في القناة المحددة.", reply_markup=kb)
+                await message.reply(f"✅ تم بدء بث **{station_name}** بنجاح عبر حساب المساعد.", reply_markup=kb)
             
             except Exception as call_error:
                 error_str = str(call_error)
                 await wait_msg.delete()
                 if "CreateGroupCallRequest" in error_str or "privileges are required" in error_str or "GroupCallNotFound" in error_str:
-                    await message.reply("❌ المكالمة مقفولة! يرجى فتح المكالمة الصوتية في القناة/الجروب أولاً ثم اضغط بدء البث مجدداً.", reply_markup=kb)
+                    await message.reply("❌ المكالمة مقفولة! يرجى فتح المكالمة الصوتية (الكول) في الجروب أولاً ثم أعد المحاولة لتشغيل البث.", reply_markup=kb)
                 else:
                     await message.reply(f"❌ حدث خطأ أثناء تشغيل البث:\n`{call_error}`", reply_markup=kb)
 
@@ -240,7 +250,7 @@ async def main_router(client, message):
         return
 
 
-    # ----------------- الأوامر الأساسية والأزرار للمستخدم والمطور -----------------
+    # ----------------- الأوامر الأساسية والأزرار للمخدمين والمطور -----------------
     if text == "/start":
         user_steps.pop(user_id, None)
         await message.reply("مرحباً بك في بوت الإذاعات القرآنية.\nاختر من القائمة بالأسفل لتتحكم في البث:", reply_markup=kb)
@@ -250,14 +260,13 @@ async def main_router(client, message):
         if user_chats:
             msg = "✅ البثوث التي قمت بتشغيلها وتعمل حالياً:\n\n"
             for c_id, info in user_chats.items():
-                msg += f"- القناة: `{c_id}`\n- الإذاعة: **{info['station']}**\n\n"
+                msg += f"- الجروب/القناة: `{c_id}`\n- الإذاعة: **{info['station']}**\n\n"
             await message.reply(msg, reply_markup=kb)
         else:
             await message.reply("❌ لا يوجد لديك أي بث شغال حالياً.", reply_markup=kb)
 
     elif text == "بدء البث":
         user_stream_count = sum(1 for info in active_streams.values() if info["user_id"] == user_id)
-        # التحقق: إذا لم يكن أدمن ولم يكن في قائمة الاستثناء (whitelisted)، يقتصر على بث واحد فقط
         if not is_admin and user_id not in whitelisted_users and user_stream_count >= 1:
             await message.reply("⚠️ عذراً، مسموح للمستخدمين بتشغيل بث واحد فقط في نفس الوقت. قم بإيقاف البث الحالي أولاً.", reply_markup=kb)
             return
@@ -267,7 +276,7 @@ async def main_router(client, message):
             return
 
         user_steps[user_id] = "WAITING_FOR_CHAT_ID"
-        await message.reply("يرجى إرسال أيدي (ID)، أو معرف (اليوزرنيم)، أو رابط القناة/الجروب لتشغيل البث فيه:\n(اضغط 'رجوع' للإلغاء)", reply_markup=back_kb)
+        await message.reply("يرجى إرسال رابط الجروب أو القناة الآن لتشغيل البث فيه:\n(اضغط 'رجوع' للإلغاء)", reply_markup=back_kb)
 
     elif text == "إيقاف البث":
         user_chats = [c_id for c_id, info in active_streams.items() if info["user_id"] == user_id]
@@ -318,7 +327,7 @@ async def main_router(client, message):
                     pass
                 paused_streams[c_id] = info
             active_streams.clear()
-            await message.reply("✅ تم إيقاف جميع البثوث النشطة مؤقتاً وحفظها لإعادة التشغيل لاحقاً.", reply_markup=kb)
+            await message.reply("✅ تم إيقاف جميع البثوث النشطة مؤقتاً وحفظ شيوخ الإذاعات لإعادة تشغيلها لاحقاً.", reply_markup=kb)
 
         elif text == "تشغيل البثوث":
             if not paused_streams:
@@ -326,8 +335,17 @@ async def main_router(client, message):
                 return
             
             success_count = 0
+            wait_reply = await message.reply("⏳ جاري تنشيط الاتصال الفريش وإعادة تشغيل البثوث بصوت شيوخها...")
+            
             for c_id, info in list(paused_streams.items()):
                 try:
+                    # تنظيف إجباري وإجلاء الحساب من الكول لتنشيط تدفق الصوت ومنع البث الصامت
+                    try:
+                        await call_py.leave_call(c_id)
+                        await asyncio.sleep(0.5)
+                    except:
+                        pass
+                        
                     stream_url = STATIONS.get(info["station"])
                     await call_py.play(c_id, MediaStream(stream_url))
                     active_streams[c_id] = info
@@ -335,7 +353,7 @@ async def main_router(client, message):
                 except:
                     pass
             paused_streams.clear()
-            await message.reply(f"✅ تم إعادة تشغيل ({success_count}) بث بنجاح.", reply_markup=kb)
+            await wait_reply.edit_text(f"✅ تم بنجاح إعادة تشغيل ({success_count}) بث بالكامل بصوت نفس القراء وبأعلى استقرار للصوت بدون أي تعليق!", reply_markup=kb)
 
         elif text == "حذف حساب مساعد":
             if call_py:
