@@ -6,6 +6,7 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Chat  # استيراد الأنواع للتفريق بين القنوات والمجموعات
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
@@ -67,10 +68,7 @@ async def main_router(client, message):
     user_id = message.from_user.id
     is_admin = (user_id == ADMIN_ID)
     
-    # لوحة المفاتيح الافتراضية للمستخدم الحالي
     kb = admin_kb if is_admin else user_kb
-
-    # ----------------- فحص حالة المستخدم (State Machine) -----------------
     step_data = user_steps.get(user_id)
 
     # 1. حالة انتظار جلسة الحساب المساعد
@@ -78,7 +76,6 @@ async def main_router(client, message):
         wait_msg = await message.reply("⏳ جاري فحص الجلسة والاتصال...")
         try:
             assistant_session_string = text
-            # نستخدم connect بدلاً من start لتجنب تجميد البوت إذا كانت الجلسة خاطئة
             assistant_client = TelegramClient(StringSession(assistant_session_string), API_ID, API_HASH)
             await assistant_client.connect()
             
@@ -113,7 +110,7 @@ async def main_router(client, message):
         await message.reply(f"✅ تم حفظ القناة/الجروب: `{text}`\nالآن اختر الإذاعة التي تريد تشغيلها:", reply_markup=stations_kb)
         return
 
-    # 3. حالة انتظار اختيار الإذاعة
+    # 3. حالة انتظار اختيار الإذاعة وتجهيز البث
     if isinstance(step_data, dict) and step_data.get("step") == "WAITING_FOR_STATION":
         if text == "إلغاء":
             user_steps.pop(user_id, None)
@@ -132,22 +129,21 @@ async def main_router(client, message):
         
         try:
             chat_input_str = str(chat_input).strip()
-            actual_chat_id = None
+            entity = None
 
-            # معالجة المدخلات (رقم، يوزرنيم، أو رابط) والانضمام
+            # محاولة جلب الكيان (Entity) بكافة الطرق والروابط
             try:
                 if chat_input_str.lstrip("-").isdigit():
                     chat_to_resolve = int(chat_input_str)
                     entity = await assistant_client.get_entity(chat_to_resolve)
-                    actual_chat_id = entity.id
                 elif "t.me/+" in chat_input_str or "t.me/joinchat/" in chat_input_str:
                     hash_str = chat_input_str.split("/")[-1].replace("+", "")
                     try:
                         updates = await assistant_client(ImportChatInviteRequest(hash_str))
-                        actual_chat_id = updates.chats[0].id
+                        entity = updates.chats[0]
                     except Exception:
                         invite = await assistant_client(CheckChatInviteRequest(hash_str))
-                        actual_chat_id = invite.chat.id
+                        entity = invite.chat
                 else:
                     username = chat_input_str.split("/")[-1] if "t.me/" in chat_input_str else chat_input_str
                     try:
@@ -155,17 +151,25 @@ async def main_router(client, message):
                     except Exception: 
                         pass
                     entity = await assistant_client.get_entity(username)
-                    actual_chat_id = entity.id
             except Exception as e:
-                await wait_msg.edit_text(f"❌ لم يتمكن الحساب المساعد من الانضمام أو العثور على القناة.\nالسبب: `{e}`", reply_markup=kb)
+                await wait_msg.edit_text(f"❌ لم يتمكن الحساب المساعد من الوصول للقناة أو الجروب.\nالسبب: `{e}`", reply_markup=kb)
                 user_steps.pop(user_id, None)
                 return
 
-            if not actual_chat_id:
-                await wait_msg.edit_text("❌ لم يتمكن الحساب المساعد من التعرف على القناة. تأكد من الرابط أو المعرف.", reply_markup=kb)
+            if not entity:
+                await wait_msg.edit_text("❌ لم يتم التعرف على القناة. تأكد من صحة الرابط أو المعرف.", reply_markup=kb)
                 user_steps.pop(user_id, None)
                 return
 
+            # --- هنا حل المشكلة الحاسم: تهيئة الأيدي بما يتوافق مع PyTgCalls ---
+            if isinstance(entity, Channel):
+                actual_chat_id = int(f"-100{entity.id}")  # إضافة البادئة للقنوات والمجموعات الخارقة
+            elif isinstance(entity, Chat):
+                actual_chat_id = -entity.id              # المجموعات العادية تكون سالبة فقط
+            else:
+                actual_chat_id = entity.id
+
+            # تشغيل الصوت بالمُعرف الجديد المضمون
             await call_py.play(actual_chat_id, MediaStream(stream_url))
             active_streams[user_id] = {"chat_id": actual_chat_id, "station": station_name}
             
@@ -177,7 +181,7 @@ async def main_router(client, message):
             user_steps.pop(user_id, None)
         return
 
-    # ----------------- الأوامر الأساسية والأزرار -----------------
+    # ----------------- الأوامر الأساسية والأزرار للمستخدم والمطور -----------------
     if text == "/start":
         user_steps.pop(user_id, None)
         await message.reply("مرحباً بك في بوت الإذاعات القرآنية.\nاختر من القائمة بالأسفل لتتحكم في البث:", reply_markup=kb)
@@ -217,7 +221,7 @@ async def main_router(client, message):
         user_steps.pop(user_id, None)
         await message.reply("✅ تم إلغاء العملية الحالية.", reply_markup=kb)
 
-    # ----------------- أوامر المطور فقط -----------------
+    # ----------------- أوامر التحكم الخاصة بالمطور فقط -----------------
     elif is_admin:
         if text == "إحصائيات":
             count = len(active_streams)
